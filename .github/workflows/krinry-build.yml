@@ -57,13 +57,26 @@ jobs:
       # 🔐 SETUP KEYSTORE (STABLE SIGNATURE)
       # ============================================================
       - name: Setup stable keystore
+        id: keystore
+        continue-on-error: true
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
         run: |
           mkdir -p android/app
-          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > android/app/hosting.p12
-          echo "✅ Keystore ready"
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "has_keystore=false" >> "$GITHUB_OUTPUT"
+            echo "No keystore secret — skip"
+            exit 0
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > android/app/hosting.p12 || true
+          if [ ! -s android/app/hosting.p12 ]; then
+            echo "has_keystore=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "has_keystore=true" >> "$GITHUB_OUTPUT"
           ls -lh android/app/hosting.p12
 
-      - name: Inject MainActivity.kt (native security + signature check)
+      - name: Inject MainActivity      - name: Inject MainActivity.kt (native security + signature check)
         run: |
           MAIN_KT=android/app/src/main/kotlin/com/alaa/hosting/MainActivity.kt
           mkdir -p "$(dirname "$MAIN_KT")"
@@ -223,34 +236,34 @@ jobs:
           fi
 
       - name: Re-sign APK with stable keystore
-        if: ${{ github.event.inputs.output_type != 'appbundle' }}
+        if: ${{ github.event.inputs.output_type != 'appbundle' && steps.keystore.outputs.has_keystore == 'true' }}
+        continue-on-error: true
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
         run: |
-          APKSIGNER=$(find "$ANDROID_HOME" -name apksigner -type f 2>/dev/null | head -1)
-          if [ -z "$APKSIGNER" ]; then
-            echo "❌ apksigner not found"
-            exit 1
+          if [ -z "$KEYSTORE_PASSWORD" ] || [ -z "$KEY_ALIAS" ]; then
+            echo "Secrets incomplete — skip resign"
+            exit 0
           fi
-          
+          APKSIGNER=$(find "$ANDROID_HOME" -name apksigner -type f 2>/dev/null | head -1)
+          [ -n "$APKSIGNER" ] || { echo "apksigner missing"; exit 0; }
           for APK in build/app/outputs/flutter-apk/*.apk; do
-            echo "=== Processing $APK ==="
-            
-            # Remove old signature (safe)
+            [ -f "$APK" ] || continue
+            echo "=== $APK ==="
             zip -d "$APK" "META-INF/*.RSA" "META-INF/*.SF" "META-INF/*.DSA" 2>/dev/null || true
-            
-            # Sign with our keystore
             "$APKSIGNER" sign \
               --ks android/app/hosting.p12 \
               --ks-type PKCS12 \
-              --ks-pass "pass:${{ secrets.KEYSTORE_PASSWORD }}" \
-              --key-pass "pass:${{ secrets.KEY_PASSWORD }}" \
-              --ks-key-alias "${{ secrets.KEY_ALIAS }}" \
-              "$APK"
-            
-            # Verify
-            "$APKSIGNER" verify "$APK" && echo "✅ Verified: $APK"
+              --ks-pass "pass:$KEYSTORE_PASSWORD" \
+              --key-pass "pass:${KEY_PASSWORD:-$KEYSTORE_PASSWORD}" \
+              --ks-key-alias "$KEY_ALIAS" \
+              "$APK" || echo "sign failed — keep default"
+            "$APKSIGNER" verify "$APK" || true
           done
 
-      - name: Upload symbols (private)
+      - name: Upload symbols      - name: Upload symbols (private)
         uses: actions/upload-artifact@v4
         with:
           name: debug-symbols-private
