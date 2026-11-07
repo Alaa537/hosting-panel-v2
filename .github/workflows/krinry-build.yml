@@ -1,3 +1,4 @@
+
 name: krinry Build
 
 on:
@@ -25,6 +26,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -47,19 +49,126 @@ jobs:
       - name: Create android platform
         run: flutter create --platforms android --org com.alaa --project-name hosting .
 
+      # Native signature verification
+      - name: Inject Native Signature Verification
+        shell: bash
+        run: |
+          MAIN_KT="android/app/src/main/kotlin/com/alaa/hosting/MainActivity.kt"
+
+          mkdir -p "$(dirname "$MAIN_KT")"
+
+          cat > "$MAIN_KT" <<'KOT'
+          package com.alaa.hosting
+
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import io.flutter.embedding.android.FlutterActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.MethodChannel
+          import java.security.MessageDigest
+
+          class MainActivity : FlutterActivity() {
+
+              private val CHANNEL = "hosting/security"
+
+              override fun configureFlutterEngine(
+                  flutterEngine: FlutterEngine
+              ) {
+                  super.configureFlutterEngine(flutterEngine)
+
+                  MethodChannel(
+                      flutterEngine.dartExecutor.binaryMessenger,
+                      CHANNEL
+                  ).setMethodCallHandler { call, result ->
+
+                      when (call.method) {
+                          "getApkSignatureSha256" -> {
+                              try {
+                                  result.success(getApkSignatureSha256())
+                              } catch (e: Exception) {
+                                  android.util.Log.e(
+                                      "HostingSecurity",
+                                      "Signature error",
+                                      e
+                                  )
+                                  result.error(
+                                      "SIGNATURE_ERROR",
+                                      e.message,
+                                      null
+                                  )
+                              }
+                          }
+
+                          else -> result.notImplemented()
+                      }
+                  }
+              }
+
+              private fun getApkSignatureSha256(): String {
+                  val info = if (Build.VERSION.SDK_INT >= 28) {
+                      packageManager.getPackageInfo(
+                          packageName,
+                          PackageManager.GET_SIGNING_CERTIFICATES
+                      )
+                  } else {
+                      @Suppress("DEPRECATION")
+                      packageManager.getPackageInfo(
+                          packageName,
+                          PackageManager.GET_SIGNATURES
+                      )
+                  }
+
+                  val signatures = if (Build.VERSION.SDK_INT >= 28) {
+                      info.signingInfo?.apkContentsSigners
+                  } else {
+                      @Suppress("DEPRECATION")
+                      info.signatures
+                  }
+
+                  val certificate = signatures?.firstOrNull()
+                      ?: throw IllegalStateException("Certificate not found")
+
+                  return MessageDigest.getInstance("SHA-256")
+                      .digest(certificate.toByteArray())
+                      .joinToString(":") {
+                          "%02X".format(it.toInt() and 0xFF)
+                      }
+              }
+          }
+          KOT
+
+          echo "Native signature verification injected"
+
       - name: Patch AndroidManifest
         run: |
           python3 << 'PY'
           from pathlib import Path
           import re
+
           p = Path('android/app/src/main/AndroidManifest.xml')
           s = p.read_text()
-          s = re.sub(r'android:label="[^"]*"', 'android:label="HOST PANEL"', s, count=1)
+
+          s = re.sub(
+              r'android:label="[^"]*"',
+              'android:label="HOST PANEL"',
+              s,
+              count=1
+          )
+
           if 'android.permission.INTERNET' not in s:
-              perms = '    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n'
+              perms = (
+                  '    <uses-permission android:name="android.permission.INTERNET"/>\n'
+                  '    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n'
+              )
               s = s.replace('<application', perms + '    <application', 1)
+
           if 'usesCleartextTraffic' not in s:
-              s = s.replace('<application', '<application android:usesCleartextTraffic="true"', 1)
+              s = s.replace(
+                  '<application',
+                  '<application android:usesCleartextTraffic="true"',
+                  1
+              )
+
           p.write_text(s)
           print('manifest ok')
           PY
@@ -71,14 +180,24 @@ jobs:
         run: |
           TYPE="${{ github.event.inputs.build_type }}"
           OUT="${{ github.event.inputs.output_type }}"
+
           FLAGS="--obfuscate --split-debug-info=build/symbols"
+
           if [ "$OUT" = "apk" ]; then
             flutter build apk --$TYPE $FLAGS
+
           elif [ "$OUT" = "apk-split" ]; then
             flutter build apk --$TYPE $FLAGS --split-per-abi
+
           else
             flutter build appbundle --$TYPE $FLAGS
           fi
+
+      - name: Verify APK output
+        if: ${{ github.event.inputs.output_type != 'appbundle' }}
+        run: |
+          ls -lh build/app/outputs/flutter-apk/
+          test -n "$(find build/app/outputs/flutter-apk -name '*.apk' -print -quit)"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -87,4 +206,5 @@ jobs:
           path: |
             build/app/outputs/flutter-apk/*.apk
             build/app/outputs/bundle/*/*.aab
+          if-no-files-found: error
           retention-days: 7
